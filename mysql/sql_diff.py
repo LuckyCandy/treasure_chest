@@ -1,11 +1,13 @@
 import re
 import argparse
 import os
+import sys
 
 """对比mysqldump出的sql脚本，生成修改语句(仅支持建表、增加编辑删除字段，增加删除索引)"""
 
 
-def parse_table_schema(create_table_sql):
+def parse_table_schema(create_table_sql, ignore_charset):
+    pattern = r"(CHARACTER\s*?SET\s*\w*?\s)*(COLLATE\s*\w*?\s)*"
     # Extract table name
     table_name_match = re.search(r"CREATE TABLE `(\w+)`", create_table_sql)
     table_name = table_name_match.group(1) if table_name_match else "Unknown"
@@ -13,12 +15,15 @@ def parse_table_schema(create_table_sql):
     # Extract column definitions including comments
     columns = []
     # This regex now accounts for optional COMMENT clauses at the end of column definitions
-    column_matches = re.findall(r"(`([^\n\r\s]*?)\`\s+\w+.*?\s[^\n\r\s]*?COMMENT\s+\'.+?\')", create_table_sql,
+    column_matches = re.findall(r"(`([^\n\r\s]*?)`\s+\w+.*?\s[^\n\r\s]*?(COMMENT\s+\'.+?\')?),", create_table_sql,
                                 re.DOTALL)
     for column in column_matches:
+        statement = column[0].strip()
+        if ignore_charset:
+            statement = re.sub(pattern, "", statement)
         columns.append({
             "name": column[1].strip(),
-            "statement": column[0].strip(),
+            "statement": statement,
         })
     indexs = []
     index_matches = re.findall(r"((PRIMARY|UNIQUE|FULLTEXT|SPATIAL)?\sKEY\s+(`\w+`)?\s?(\(.*?\)))", create_table_sql,
@@ -33,19 +38,19 @@ def parse_table_schema(create_table_sql):
 
     return {
         "table_name": table_name,
-        "all": create_table_sql,
+        "all": re.sub(r"AUTO_INCREMENT=\d+", "", create_table_sql),
         "index": indexs,
         "columns": columns
     }
 
 
-def extract_schema_from_sql(file_path):
+def extract_schema_from_sql(file_path, ignore_charset):
     with open(file_path, 'r') as file:
         sql_content = file.read()
     # Extract CREATE TABLE statements
     create_table_statements = re.findall(r"CREATE TABLE.*?;\n", sql_content, re.DOTALL)
     # Parse each table's schema
-    parsed_schema = [parse_table_schema(statement) for statement in create_table_statements]
+    parsed_schema = [parse_table_schema(statement, ignore_charset) for statement in create_table_statements]
     return parsed_schema
 
 
@@ -114,18 +119,24 @@ def compare_and_generate_sql(source_schema, target_schema):
 
 def main():
     parser = argparse.ArgumentParser(description="Compare two SQL files and generate modification statements.")
-    parser.add_argument("-s", "--source", required=True, help="source schema file")
-    parser.add_argument("-t", "--target", required=True, help="target schema file")
-    parser.add_argument("-o", "--output", required=True, help="output modification statements file")
+    parser.add_argument("-s", "--source", required=True, help="源目标文件")
+    parser.add_argument("-t", "--target", required=True, help="参考sql文件")
+    parser.add_argument("-o", "--output", required=True, help="生成变更的文件名")
+    parser.add_argument("--ignore-charset", dest="ic", action="store_true", default=False, help="是否忽略字符集和排序规则")
     args = parser.parse_args()
 
     if not os.path.isfile(args.source) or not os.path.isfile(args.target):
         print(f"The specified input file '{args.source}' or '{args.target}' does not exist.")
         return
 
-    source_parsed_schema = extract_schema_from_sql(args.source)
-    target_parsed_schema = extract_schema_from_sql(args.target)
-    print(compare_and_generate_sql(source_parsed_schema, target_parsed_schema))
+    source_parsed_schema = extract_schema_from_sql(args.source, args.ic)
+    target_parsed_schema = extract_schema_from_sql(args.target, args.ic)
+    statements = compare_and_generate_sql(source_parsed_schema, target_parsed_schema)
+    if not statements:
+        print(f"No modification statements found for '{args.source}' and '{args.target}'.")
+        sys.exit(0)
+    with open(args.output, "w") as f:
+        f.write(statements)
 
 
 if __name__ == "__main__":
